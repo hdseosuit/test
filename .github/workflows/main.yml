@@ -8,23 +8,61 @@ jobs:
     runs-on: windows-2022
 
     steps:
-      - name: Install & Connect Tailscale
+      - name: Validate Secrets
         shell: powershell
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+              Write-Error "TAILSCALE_AUTHKEY secret is empty. Add it in GitHub Secrets."
+              exit 1
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+              Write-Error "RDP_PASSWORD secret is empty. Add it in GitHub Secrets."
+              exit 1
+          }
+
+          Write-Host "Secrets are configured."
+
+      - name: Install and Connect Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
 
+          Write-Host "Downloading Tailscale..."
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+
+          Write-Host "Installing Tailscale..."
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
 
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=gh-rdp-${{ github.run_id }}
+          $tailscaleExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-          $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-          "TAILSCALE_IP=$tsIP" | Out-File -Append $env:GITHUB_ENV
+          Write-Host "Connecting to Tailscale..."
+          & $tailscaleExe up --authkey="$env:TAILSCALE_AUTHKEY" --hostname="gh-rdp-${{ github.run_id }}" --accept-dns=false
+
+          Start-Sleep -Seconds 5
+
+          $tsIP = & $tailscaleExe ip -4
+
+          if ([string]::IsNullOrWhiteSpace($tsIP)) {
+              Write-Error "Could not get Tailscale IP."
+              exit 1
+          }
+
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          Write-Host "Tailscale IP: $tsIP"
 
       - name: Enable Remote Desktop
         shell: powershell
         run: |
+          Write-Host "Enabling Remote Desktop..."
+
           Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
             -Name "fDenyTSConnections" `
             -Value 0
@@ -35,39 +73,51 @@ jobs:
 
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
+          Write-Host "Remote Desktop enabled."
+
       - name: Set RDP User Password
         shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           $username = "runneradmin"
-          $password = "${{ secrets.RDP_PASSWORD }}"
 
-          if ([string]::IsNullOrWhiteSpace($password)) {
-              Write-Error "RDP_PASSWORD secret is empty. Add it in GitHub Secrets."
+          Write-Host "Setting password for user: $username"
+
+          net user $username "$env:RDP_PASSWORD"
+
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "Failed to set password for $username"
               exit 1
           }
 
-          net user $username $password
+          net localgroup "Remote Desktop Users" $username /add
 
-          Write-Host "RDP password has been set for user: $username"
+          Write-Host "Password set successfully."
 
-      - name: Make Sure RDP Service Is Running
+      - name: Start RDP Service
         shell: powershell
         run: |
+          Write-Host "Starting Remote Desktop service..."
+
           Set-Service -Name TermService -StartupType Automatic
           Start-Service -Name TermService -ErrorAction SilentlyContinue
 
-          Write-Host "Remote Desktop service is running."
+          Get-Service -Name TermService
+
+          Write-Host "RDP service is running."
 
       - name: Show Connection Details
         shell: powershell
         run: |
-          Write-Host "======================="
-          Write-Host "RDP CONNECTION DETAILS:"
-          Write-Host "Computer: $($env:TAILSCALE_IP)"
+          Write-Host "=============================="
+          Write-Host "RDP CONNECTION DETAILS"
+          Write-Host "=============================="
+          Write-Host "Computer/IP: $($env:TAILSCALE_IP)"
           Write-Host "Port: 3389"
           Write-Host "Username: runneradmin"
           Write-Host "Password: Use your GitHub Secret RDP_PASSWORD"
-          Write-Host "======================="
+          Write-Host "=============================="
 
       - name: Keep Alive
         shell: powershell
@@ -75,6 +125,6 @@ jobs:
           $endTime = (Get-Date).AddHours(6)
 
           while ((Get-Date) -lt $endTime) {
-              Write-Host "RDP is still online | $(Get-Date)"
+              Write-Host "RDP is still online | IP: $($env:TAILSCALE_IP) | $(Get-Date)"
               Start-Sleep -Seconds 60
           }

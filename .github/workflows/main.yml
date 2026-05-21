@@ -1,130 +1,245 @@
-name: Setup RDP Server
+name: RDP Tailscale RustDesk Emulator Friendly
 
 on:
   workflow_dispatch:
+    inputs:
+      runtime_minutes:
+        description: "Runtime minutes max 360"
+        required: false
+        default: "355"
+      crd_code:
+        description: "Optional Chrome Remote Desktop code"
+        required: false
+        default: ""
+      crd_pin:
+        description: "CRD PIN 6-12 digits"
+        required: false
+        default: "123456"
+
+permissions:
+  contents: read
 
 jobs:
-  setup-rdp:
-    runs-on: windows-2022
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 370
+
+    env:
+      RDP_USER: Bullettemporary
+      RDP_PASS: ${{ secrets.RDP_PASSWORD }}
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
 
     steps:
       - name: Validate Secrets
         shell: powershell
-        env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
-              Write-Error "TAILSCALE_AUTHKEY secret is empty. Add it in GitHub Secrets."
-              exit 1
+            Write-Error "TAILSCALE_AUTHKEY secret is empty."
+            exit 1
           }
 
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-              Write-Error "RDP_PASSWORD secret is empty. Add it in GitHub Secrets."
-              exit 1
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASS)) {
+            Write-Error "RDP_PASSWORD secret is empty."
+            exit 1
           }
 
-          Write-Host "Secrets are configured."
+          if ($env:RDP_PASS.Length -lt 12) {
+            Write-Error "RDP_PASSWORD must be at least 12 characters."
+            exit 1
+          }
 
-      - name: Install and Connect Tailscale
+          Write-Host "Secrets OK."
+
+      - name: Install Tailscale
         shell: powershell
-        env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-          Write-Host "Downloading Tailscale..."
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          if (-not (Test-Path $ts)) {
+            $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+            $dst = "$env:TEMP\tailscale.msi"
 
-          Write-Host "Installing Tailscale..."
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+            Invoke-WebRequest -Uri $url -OutFile $dst
+            Start-Process msiexec.exe -ArgumentList "/i","`"$dst`"","/quiet","/norestart" -Wait
+            Remove-Item $dst -Force
+          }
 
-          $tailscaleExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          Write-Host "Tailscale installed."
 
-          Write-Host "Connecting to Tailscale..."
-          & $tailscaleExe up --authkey="$env:TAILSCALE_AUTHKEY" --hostname="gh-rdp-${{ github.run_id }}" --accept-dns=false
+      - name: Connect Tailscale
+        shell: powershell
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
+          $env:TS_AUTHKEY = $env:TAILSCALE_AUTHKEY
+
+          & $ts logout | Out-Null
+          & $ts up --hostname "bullet-${{ github.run_id }}" --accept-dns=true --accept-routes=true
+
+          Start-Sleep -Seconds 8
+
+          $ip4 = & $ts ip -4 | Select-Object -First 1
+
+          if ([string]::IsNullOrWhiteSpace($ip4)) {
+            Write-Error "Could not get Tailscale IP."
+            exit 1
+          }
+
+          "TAILSCALE_IP=$ip4" | Out-File -Append $env:GITHUB_ENV
+          Write-Host "Tailscale IPv4: $ip4"
+
+      - name: Create RDP User and Enable Remote Desktop
+        shell: powershell
+        run: |
+          $u = $env:RDP_USER
+          $p = $env:RDP_PASS
+          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
+          } else {
+            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Enable-LocalUser -Name $u
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member $u -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u -ErrorAction SilentlyContinue
+
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name UserAuthentication -Value 1
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+
+          Write-Host "RDP enabled."
+          Write-Host "Username: $u"
+          Write-Host "IP: $env:TAILSCALE_IP"
+
+      - name: Install RustDesk
+        shell: powershell
+        run: |
+          $rdExe = "C:\Program Files\RustDesk\rustdesk.exe"
+
+          if (-not (Test-Path $rdExe)) {
+            $rdUrl = "https://github.com/rustdesk/rustdesk/releases/download/1.3.1/rustdesk-1.3.1-x86_64.msi"
+            $installerPath = "$env:TEMP\rustdesk.msi"
+
+            Invoke-WebRequest -Uri $rdUrl -OutFile $installerPath
+            Start-Process msiexec.exe -ArgumentList "/i","`"$installerPath`"","/quiet","/norestart" -Wait
+            Remove-Item $installerPath -Force
+          }
+
+          if (-not (Test-Path $rdExe)) {
+            Write-Error "RustDesk was not installed."
+            exit 1
+          }
+
+          Write-Host "RustDesk installed."
+
+      - name: Open RustDesk Ports
+        shell: powershell
+        run: |
+          for ($p = 21115; $p -le 21119; $p++) {
+            netsh advfirewall firewall delete rule name="RustDesk-TCP-$p" 2>$null
+            netsh advfirewall firewall add rule name="RustDesk-TCP-$p" dir=in action=allow protocol=TCP localport=$p
+          }
+
+          netsh advfirewall firewall delete rule name="RustDesk-UDP-21116" 2>$null
+          netsh advfirewall firewall add rule name="RustDesk-UDP-21116" dir=in action=allow protocol=UDP localport=21116
+
+      - name: Launch RustDesk
+        shell: powershell
+        run: |
+          $rdExe = "C:\Program Files\RustDesk\rustdesk.exe"
+          Start-Process -FilePath $rdExe
           Start-Sleep -Seconds 5
+          Write-Host "RustDesk launched."
 
-          $tsIP = & $tailscaleExe ip -4
+      - name: Optional Install Chrome Remote Desktop
+        if: ${{ inputs.crd_code != '' }}
+        shell: powershell
+        run: |
+          $pin = "${{ inputs.crd_pin }}".Trim()
 
-          if ([string]::IsNullOrWhiteSpace($tsIP)) {
-              Write-Error "Could not get Tailscale IP."
-              exit 1
+          if ($pin -notmatch '^\d{6,12}$') {
+            Write-Error "CRD PIN must be 6-12 digits."
+            exit 1
           }
 
-          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $starter = "${Env:PROGRAMFILES(X86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
 
-          Write-Host "Tailscale IP: $tsIP"
-
-      - name: Enable Remote Desktop
-        shell: powershell
-        run: |
-          Write-Host "Enabling Remote Desktop..."
-
-          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
-            -Name "fDenyTSConnections" `
-            -Value 0
-
-          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
-            -Name "UserAuthentication" `
-            -Value 1
-
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-
-          Write-Host "Remote Desktop enabled."
-
-      - name: Set RDP User Password
-        shell: powershell
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          $username = "runneradmin"
-
-          Write-Host "Setting password for user: $username"
-
-          net user $username "$env:RDP_PASSWORD"
-
-          if ($LASTEXITCODE -ne 0) {
-              Write-Error "Failed to set password for $username"
-              exit 1
+          if (-not (Test-Path $starter)) {
+            $msi = "$env:TEMP\chromeremotedesktophost.msi"
+            Invoke-WebRequest -Uri "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi" -OutFile $msi
+            Start-Process msiexec.exe -ArgumentList "/i","`"$msi`"","/quiet","/norestart" -Wait
+            Remove-Item $msi -Force
           }
 
-          net localgroup "Remote Desktop Users" $username /add
+          $raw = @'
+          ${{ inputs.crd_code }}
+          '@.Trim()
 
-          Write-Host "Password set successfully."
+          if ($raw -match '--code\s*=\s*"?([^"\s]+)') {
+            $code = ([regex]::Match($raw,'--code\s*=\s*"?([^"\s]+)')).Groups[1].Value
+          } elseif ($raw -match '^4\/') {
+            $code = $raw
+          } else {
+            Write-Error "Could not detect CRD code."
+            exit 1
+          }
 
-      - name: Start RDP Service
+          $redir = "https://remotedesktop.google.com/_/oauthredirect"
+          $name = $env:COMPUTERNAME
+
+          $args = @(
+            "--code=""$code""",
+            "--redirect-url=""$redir""",
+            "--name=""$name""",
+            "--pin=""$pin"""
+          )
+
+          Start-Process -FilePath $starter -ArgumentList $args
+          Write-Host "Chrome Remote Desktop launched."
+
+      - name: Check Display Adapter
         shell: powershell
         run: |
-          Write-Host "Starting Remote Desktop service..."
+          Write-Host "Display adapter:"
+          Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM, DriverVersion
 
-          Set-Service -Name TermService -StartupType Automatic
-          Start-Service -Name TermService -ErrorAction SilentlyContinue
-
-          Get-Service -Name TermService
-
-          Write-Host "RDP service is running."
+          Write-Host "DirectX:"
+          dxdiag /t "$env:TEMP\dxdiag.txt"
+          Start-Sleep -Seconds 5
+          Get-Content "$env:TEMP\dxdiag.txt" | Select-String "Card name|Display Memory|Driver Model|DirectX"
 
       - name: Show Connection Details
         shell: powershell
         run: |
           Write-Host "=============================="
-          Write-Host "RDP CONNECTION DETAILS"
+          Write-Host "CONNECTION DETAILS"
           Write-Host "=============================="
-          Write-Host "Computer/IP: $($env:TAILSCALE_IP)"
-          Write-Host "Port: 3389"
-          Write-Host "Username: runneradmin"
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "RDP Port: 3389"
+          Write-Host "Username: $env:RDP_USER"
           Write-Host "Password: Use your GitHub Secret RDP_PASSWORD"
+          Write-Host "RustDesk is opened on the desktop."
           Write-Host "=============================="
 
       - name: Keep Alive
         shell: powershell
         run: |
-          $endTime = (Get-Date).AddHours(6)
+          $mins = [int]"${{ inputs.runtime_minutes }}"
 
-          while ((Get-Date) -lt $endTime) {
-              Write-Host "RDP is still online | IP: $($env:TAILSCALE_IP) | $(Get-Date)"
-              Start-Sleep -Seconds 60
+          if ($mins -lt 5) {
+            $mins = 355
+          }
+
+          if ($mins -gt 360) {
+            $mins = 355
+          }
+
+          $end = (Get-Date).AddMinutes($mins)
+
+          while ((Get-Date) -lt $end) {
+            Write-Host "RDP online | IP: $env:TAILSCALE_IP | Ends: $end"
+            Start-Sleep -Seconds 60
           }
